@@ -48,16 +48,18 @@ INSTRUCCION_MUSICA = (
     "usuário aceita sua sugestão de música): termine com [MUSICA:LOCAL]\n"
     "- Pedido com gênero, mood, artista ou música específica (ex: 'algo de jazz', 'uma de rock', "
     "'toca tal música'): termine com [MUSICA:YT:<termo de busca que funcione bem no YouTube>]\n"
+    "- Pedido para repetir/tocar de novo a música anterior ou a última que tocou (ex: 'bota a de "
+    "antes', 'a última que você colocou'): termine com [MUSICA:LAST]\n"
     "Só use essas tags quando o usuário claramente quiser que uma música comece a tocar agora "
     "(um pedido direto, ou um 'sim'/'dale' respondendo a uma sugestão sua). Nunca mencione essas "
     "tags na resposta visível nem explique que elas existem."
 )
 
-PATRON_MUSICA = re.compile(r"\[MUSICA:(LOCAL|YT:[^\]]*)\]", re.IGNORECASE)
+PATRON_MUSICA = re.compile(r"\[MUSICA:(LOCAL|LAST|YT:[^\]]*)\]", re.IGNORECASE)
 
 CLASIFICADOR_MUSICA_PROMPT = """Sos un clasificador. Analiza el mensaje de un usuario en un chat de Discord \
 y determiná si está pidiendo una acción sobre la música que se reproduce en el servidor (poner una \
-canción, pausar, reanudar, saltar, parar, o activar/desactivar loop).
+canción, repetir la última que sonó, pausar, reanudar, saltar, parar, o activar/desactivar loop).
 
 Sé ESTRICTO: si tenés dudas de que el mensaje sea realmente un pedido de acción, respondé que NO lo es. \
 No interpretes como pedido charla casual, preguntas sobre música (ej: "¿qué canción es esta?"), \
@@ -65,6 +67,8 @@ menciones incidentales de canciones, ni mensajes ambiguos.
 
 Reglas para "accion" (solo si es_musica es true):
 - "play": quiere que se reproduzca algo (una canción, género, mood, artista, o "algo" genérico)
+- "last": quiere que se repita/vuelva a poner la canción anterior o la última que sonó (ej: "poné la de antes", \
+"la última que pusiste", "repetí lo de recién")
 - "skip": quiere pasar a la siguiente canción
 - "pause": quiere pausar
 - "resume": quiere reanudar/continuar
@@ -77,7 +81,7 @@ Si accion es "play":
 término de búsqueda efectivo para YouTube
 
 Respondé ÚNICAMENTE con un JSON con este formato exacto, sin texto adicional ni markdown:
-{{"es_musica": true|false, "accion": "play"|"skip"|"pause"|"resume"|"stop"|"loop"|null, "tipo": "local"|"youtube"|null, "query": "string o null"}}
+{{"es_musica": true|false, "accion": "play"|"last"|"skip"|"pause"|"resume"|"stop"|"loop"|null, "tipo": "local"|"youtube"|null, "query": "string o null"}}
 
 Mensaje del usuario: "{mensaje}"
 """
@@ -117,6 +121,8 @@ def extraer_comando_musica(texto):
 
     if contenido.upper() == "LOCAL":
         return texto_limpio, "local", None
+    if contenido.upper() == "LAST":
+        return texto_limpio, "last", None
     if contenido.upper().startswith("YT:"):
         query = contenido[3:].strip()
         return texto_limpio, "youtube", query
@@ -195,6 +201,7 @@ def get_state(guild_id):
             "update_task":        None,
             "forzar_siguiente":   False,  # fuerza avanzar la cola aunque loop esté activo (skip)
             "ignorar_avance":     False,  # evita que un stop() manual (seek) dispare el avance de cola
+            "historial":          [],     # canciones ya reproducidas, la más reciente al final
         }
     return guilds_state[guild_id]
 
@@ -245,6 +252,12 @@ async def ia_reproducir_musica(message, tipo, query=None):
             await ctx.send("❌ Não tenho músicas locais disponíveis agora.")
             return
         item = {"tipo": "local", "nombre": random.choice(canciones)}
+    elif tipo == "last":
+        entrada = obtener_ultima_cancion(state)
+        if not entrada:
+            await ctx.send("❌ Ainda não toquei nada nesta sessão.")
+            return
+        item = {"tipo": entrada["tipo"], "nombre": entrada["nombre"], "url": entrada.get("url")}
     else:
         busqueda = (query or "").strip()
         if not busqueda:
@@ -274,6 +287,10 @@ PALABRAS_ACCION = {
     "resume": ["seguí", "segui", "seguir", "continuá", "continua", "resume"],
     "stop":   ["parar", "pará", "para", "detené", "detene", "stop"],
     "loop":   ["repetir", "loop", "en bucle"],
+    # Va antes de "play" porque frases como "poné la última" también contienen
+    # la palabra de play ("poné") y queremos que gane esta acción más específica.
+    "last":   ["última música", "ultima musica", "última canção", "ultima cancion",
+               "de antes", "anterior", "o que tocou antes", "lo que tocaste antes"],
     "play":   ["poné", "pone", "poner", "reproduce", "reproducí", "reproduci"],
 }
 
@@ -296,7 +313,7 @@ async def detectar_accion_musica(message):
                     await ctx.invoke(play, query=query)
                 else:
                     comando = {"skip": skip, "pause": pause, "resume": resume,
-                               "stop": stop, "loop": loop}[accion]
+                               "stop": stop, "loop": loop, "last": ultima}[accion]
                     await ctx.invoke(comando)
                 return True
 
@@ -318,9 +335,9 @@ async def detectar_accion_musica(message):
             return False
         return True
 
-    if accion in ("skip", "pause", "resume", "stop", "loop"):
+    if accion in ("skip", "pause", "resume", "stop", "loop", "last"):
         comando = {"skip": skip, "pause": pause, "resume": resume,
-                   "stop": stop, "loop": loop}[accion]
+                   "stop": stop, "loop": loop, "last": ultima}[accion]
         await ctx.invoke(comando)
         return True
 
@@ -909,6 +926,29 @@ def resolver_fuente_audio(item, volumen, seek=0):
     )
 
 
+MAX_HISTORIAL_CANCIONES = 20
+
+def agregar_al_historial(state, item):
+    """Guarda una versión mínima del item para poder re-encolarlo después con
+    'm!ultima' sin arrastrar datos que quedan viejos (duracion_seg, thumbnail)."""
+    entrada = {"tipo": item["tipo"], "nombre": item["nombre"], "url": item.get("url")}
+    state["historial"].append(entrada)
+    if len(state["historial"]) > MAX_HISTORIAL_CANCIONES:
+        state["historial"] = state["historial"][-MAX_HISTORIAL_CANCIONES:]
+
+def obtener_ultima_cancion(state):
+    """Devuelve la canción reproducida justo antes de la actual. Si no hay nada
+    sonando ahora, devuelve la última que sonó. None si no hay historial suficiente."""
+    historial = state.get("historial", [])
+    if state["current"] is not None:
+        if len(historial) >= 2:
+            return historial[-2]
+        return None
+    if historial:
+        return historial[-1]
+    return None
+
+
 def play_next(voice_client, state, ctx):
     if state.get("ignorar_avance"):
         state["ignorar_avance"] = False
@@ -921,7 +961,8 @@ def play_next(voice_client, state, ctx):
         forzar = state.get("forzar_siguiente", False)
         state["forzar_siguiente"] = False
 
-        if state["loop"] and state["current"] and not forzar:
+        es_repeticion_loop = state["loop"] and state["current"] and not forzar
+        if es_repeticion_loop:
             item = state["current"]
         else:
             if not state["queue"]:
@@ -943,6 +984,9 @@ def play_next(voice_client, state, ctx):
 
     if item["tipo"] == "local":
         item["duracion_seg"] = get_duracion_segundos(f"data/{item['nombre']}.mp3")
+
+    if not es_repeticion_loop:
+        agregar_al_historial(state, item)
 
     def after(error):
         bot.loop.call_soon_threadsafe(play_next, voice_client, state, ctx)
@@ -1208,6 +1252,32 @@ async def play(ctx, *, query: str):
     if voice.is_playing() or voice.is_paused():
         state["queue"].append(item)
         await ctx.send(f"➕ Adicionado à fila: `{nombre_mostrar}` (posición {len(state['queue'])})")
+    else:
+        state["queue"] = [item]
+        play_next(voice, state, ctx)
+
+@bot.command(name="ultima", aliases=["last", "anterior"])
+async def ultima(ctx):
+    if not await ensure_voice(ctx):
+        return
+
+    state = get_state(ctx.guild.id)
+    entrada = obtener_ultima_cancion(state)
+    if not entrada:
+        await ctx.send("❌ Ainda não toquei nada nesta sessão.")
+        return
+
+    item = {
+        "tipo": entrada["tipo"],
+        "nombre": entrada["nombre"],
+        "url": entrada.get("url"),
+        "agregado_por": ctx.author.display_name,
+    }
+
+    voice = ctx.voice_client
+    if voice.is_playing() or voice.is_paused():
+        state["queue"].append(item)
+        await ctx.send(f"➕ Adicionado à fila: `{item['nombre']}` (posición {len(state['queue'])})")
     else:
         state["queue"] = [item]
         play_next(voice, state, ctx)
