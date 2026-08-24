@@ -1,10 +1,13 @@
 import os
+import re
 import json
 import time
 import random
 import difflib
 import asyncio
 import threading
+import urllib.request
+import urllib.error
 import discord
 from dotenv import load_dotenv
 from discord.ext import commands
@@ -34,7 +37,42 @@ def cargar_personalidad(archivo="personalidad.txt"):
 
 personalidad_bot = cargar_personalidad()
 conversaciones = {}  # user_id: chat_session de Gemini
-MAX_HISTORIAL = 10   # turnos a mantener
+MAX_HISTORIAL = 10   # turnos (usuario + bot) a mantener por usuario
+
+INSTRUCCION_MUSICA = (
+    "\n\nAlém da sua personalidade, você também pode colocar música quando o usuário pedir "
+    "ou aceitar uma sugestão sua de tocar algo. Para isso, termine sua resposta normal (sem "
+    "quebrar seu personagem) com uma das tags ocultas abaixo, exatamente nesse formato — o "
+    "sistema vai removê-las antes do usuário ver:\n"
+    "- Pedido genérico, sem gênero/artista (ex: 'toca algo', 'bota uma música', ou quando o "
+    "usuário aceita sua sugestão de música): termine com [MUSICA:LOCAL]\n"
+    "- Pedido com gênero, mood, artista ou música específica (ex: 'algo de jazz', 'uma de rock', "
+    "'toca tal música'): termine com [MUSICA:YT:<termo de busca que funcione bem no YouTube>]\n"
+    "Só use essas tags quando o usuário claramente quiser que uma música comece a tocar agora "
+    "(um pedido direto, ou um 'sim'/'dale' respondendo a uma sugestão sua). Nunca mencione essas "
+    "tags na resposta visível nem explique que elas existem."
+)
+
+PATRON_MUSICA = re.compile(r"\[MUSICA:(LOCAL|YT:[^\]]*)\]", re.IGNORECASE)
+
+def extraer_comando_musica(texto):
+    """Busca la tag oculta [MUSICA:...] en la respuesta de la IA, la saca del texto
+    visible y devuelve qué reproducir (si corresponde)."""
+    match = PATRON_MUSICA.search(texto)
+    if not match:
+        return texto, None, None
+
+    texto_limpio = PATRON_MUSICA.sub("", texto).strip()
+    contenido = match.group(1)
+
+    if contenido.upper() == "LOCAL":
+        return texto_limpio, "local", None
+    if contenido.upper().startswith("YT:"):
+        query = contenido[3:].strip()
+        return texto_limpio, "youtube", query
+    return texto_limpio, None, None
+
+
 
 intents = discord.Intents.none()
 intents.guilds = True
@@ -50,6 +88,11 @@ bot = commands.Bot(
 
 FFMPEG_PATH = "C:/ffmpeg/bin/ffmpeg.exe"
 CANAL_TEXTO_ID = 1304862792238760018
+CANAL_MUSICA_CONFIG_FILE = "canal_musica.json"
+
+# Log de errores de ffmpeg: por defecto discord.py descarta el stderr de ffmpeg,
+# así que si algo falla en silencio queda registrado acá para poder diagnosticarlo.
+FFMPEG_LOG = open("ffmpeg_error.log", "a", encoding="utf-8", buffering=1)
 
 FFMPEG_BEFORE_OPTIONS_YT = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
@@ -79,23 +122,29 @@ YDL_OPTS_PLAYLIST = {
     "skip_download": True,
 }
 
+# Distintos "player_client" que yt-dlp puede simular ante YouTube. Si el primero
+# devuelve un stream bloqueado (403), probamos los siguientes antes de rendirnos.
+CLIENTES_YT_FALLBACK = [None, "android", "ios", "web_safari"]
+
 # ── Estado global por servidor ──────────────────────────────────────────────
 guilds_state = {}
 
 def get_state(guild_id):
     if guild_id not in guilds_state:
         guilds_state[guild_id] = {
-            "queue":          [],
-            "loop":           False,
-            "volume":         1.0,
-            "current":        None,
-            "sugerencias":    [],
-            "sugerencias_yt": [],
-            "ultima_busqueda": "",
-            "start_time":     None,
-            "minuto_avisado": False,
+            "queue":              [],
+            "loop":               False,
+            "volume":             1.0,
+            "current":            None,
+            "sugerencias":        [],
+            "sugerencias_yt":     [],
+            "ultima_busqueda":    "",
+            "start_time":         None,
+            "minuto_avisado":     False,
             "mensaje_now_playing": None,
-            "update_task":    None,
+            "update_task":        None,
+            "forzar_siguiente":   False,  # fuerza avanzar la cola aunque loop esté activo (skip)
+            "ignorar_avance":     False,  # evita que un stop() manual (seek) dispare el avance de cola
         }
     return guilds_state[guild_id]
 
@@ -104,7 +153,7 @@ def get_chat_ia(user_id):
     if user_id not in conversaciones:
         modelo = genai.GenerativeModel(
             model_name="gemini-3.1-flash-lite",
-            system_instruction=personalidad_bot
+            system_instruction=personalidad_bot + INSTRUCCION_MUSICA
         )
         conversaciones[user_id] = modelo.start_chat(history=[])
     return conversaciones[user_id]
@@ -115,7 +164,7 @@ async def preguntar_ia(user_id, nombre, mensaje, imagenes=None, contexto_usuario
     contenido = [mensaje_con_nombre] + (imagenes or [])
     try:
         respuesta = await asyncio.to_thread(chat.send_message, contenido)
-        # Recortar historial si se pasa del límite
+        # Recorta el historial a los últimos MAX_HISTORIAL turnos (usuario+modelo = 2 entradas por turno)
         if len(chat.history) > MAX_HISTORIAL * 2:
             chat.history = chat.history[-MAX_HISTORIAL * 2:]
         return respuesta.text
@@ -125,7 +174,48 @@ async def preguntar_ia(user_id, nombre, mensaje, imagenes=None, contexto_usuario
     except Exception as e:
         print(f"[ERROR IA] {e}")
         return "❌ Tuve un problema para responder, probá de nuevo en un rato."
-    
+
+
+async def ia_reproducir_musica(message, tipo, query=None):
+    """Reproduce música a pedido de la IA: entra al canal de voz del usuario si
+    hace falta, y elige la canción (local al azar o el primer resultado de YouTube)."""
+    if message.guild is None:
+        return  # no hay voz en DMs
+
+    ctx = await bot.get_context(message)
+    if not await ensure_voice(ctx):
+        return
+
+    state = get_state(ctx.guild.id)
+    voice = ctx.voice_client
+
+    if tipo == "local":
+        canciones = get_canciones()
+        if not canciones:
+            await ctx.send("❌ Não tenho músicas locais disponíveis agora.")
+            return
+        item = {"tipo": "local", "nombre": random.choice(canciones)}
+    else:
+        busqueda = (query or "").strip()
+        if not busqueda:
+            return
+        resultados = buscar_youtube(busqueda, n=5)
+        if not resultados:
+            await ctx.send(f"❌ Não encontrei nada de `{busqueda}` no YouTube.")
+            return
+        elegido = resultados[0]
+        item = {"tipo": "youtube", "url": elegido["url"], "nombre": elegido["titulo"]}
+
+    item["agregado_por"] = f"{message.author.display_name} (via IA)"
+
+    if voice.is_playing() or voice.is_paused():
+        state["queue"].append(item)
+        await ctx.send(f"➕ Adicionado à fila: `{item['nombre']}` (posición {len(state['queue'])})")
+    else:
+        state["queue"] = [item]
+        play_next(voice, state, ctx)
+
+
 CANAL_PALABRAS_CLAVE = 778306961825071115
 
 PALABRAS_ACCION = {
@@ -206,7 +296,12 @@ async def on_message(message):
                 texto = "(mandó una imagen sin texto, comentala)"
             async with message.channel.typing():
                 respuesta = await preguntar_ia(message.author.id, message.author.display_name, texto, imagenes, contexto_usuario)
-            await message.reply(respuesta)
+
+            respuesta_limpia, tipo_musica, query_musica = extraer_comando_musica(respuesta)
+            await message.reply(respuesta_limpia or "🎶")
+
+            if tipo_musica:
+                await ia_reproducir_musica(message, tipo_musica, query_musica)
 
     await bot.process_commands(message)
 
@@ -261,7 +356,8 @@ def buscar_youtube(query, n=5):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=False)
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR BUSQUEDA YT] {e}")
         return []
 
     entradas = info.get("entries") or []
@@ -283,7 +379,8 @@ def extraer_playlist(url):
     try:
         with yt_dlp.YoutubeDL(YDL_OPTS_PLAYLIST) as ydl:
             info = ydl.extract_info(url, download=False)
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR PLAYLIST YT] {e}")
         return None, []
 
     nombre_playlist = info.get("title", "Playlist")
@@ -301,9 +398,13 @@ def extraer_playlist(url):
         })
     return nombre_playlist, items
 
-def extraer_audio_youtube(url):
-    """Resuelve la URL de stream de audio directo para un link/consulta de YouTube."""
-    with yt_dlp.YoutubeDL(YDL_OPTS_STREAM) as ydl:
+def extraer_audio_youtube(url, cliente=None):
+    """Resuelve la URL de stream de audio directo para un link/consulta de YouTube.
+    'cliente' permite forzar un player_client distinto de yt-dlp (android/ios/web_safari)."""
+    opts = dict(YDL_OPTS_STREAM)
+    if cliente:
+        opts["extractor_args"] = {"youtube": {"player_client": [cliente]}}
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
         if "entries" in info:
             info = info["entries"][0]
@@ -314,6 +415,35 @@ def extraer_audio_youtube(url):
             "duracion_seg": info.get("duration"),
             "thumbnail": info.get("thumbnail"),
         }
+
+def probar_stream_url(url, timeout=5):
+    """Chequeo liviano (HEAD) para detectar si YouTube está devolviendo 403 en esta URL."""
+    req = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout):
+            return True
+    except urllib.error.HTTPError as e:
+        return e.code != 403
+    except Exception:
+        # Si la validación en sí falla (timeout, DNS, etc.) dejamos que ffmpeg lo intente igual.
+        return True
+
+def extraer_audio_youtube_con_reintento(url):
+    """Extrae el audio probando distintos player_client de yt-dlp si YouTube devuelve 403."""
+    ultimo_error = None
+    for cliente in CLIENTES_YT_FALLBACK:
+        try:
+            datos = extraer_audio_youtube(url, cliente=cliente)
+        except Exception as e:
+            ultimo_error = e
+            continue
+
+        if probar_stream_url(datos["stream_url"]):
+            return datos
+
+        ultimo_error = RuntimeError(f"403 Forbidden con player_client={cliente or 'default'}")
+
+    raise ultimo_error or RuntimeError("No se pudo obtener audio de YouTube.")
 
 
 # ── Monitor de tiempo ────────────────────────────────────────────────────────
@@ -521,6 +651,8 @@ class MusicControlView(discord.ui.View):
     async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         voice = interaction.guild.voice_client
         if voice and (voice.is_playing() or voice.is_paused()):
+            state = get_state(self.guild_id)
+            state["forzar_siguiente"] = True  # avanza aunque loop esté activo
             voice.stop()
             await interaction.response.send_message("⏭️ Música pulada.", ephemeral=True)
         else:
@@ -578,6 +710,43 @@ async def actualizar_progreso(guild_id, mensaje):
         return
 
 
+def cargar_canal_musica(guild_id):
+    if not os.path.exists(CANAL_MUSICA_CONFIG_FILE):
+        return None
+
+    try:
+        with open(CANAL_MUSICA_CONFIG_FILE, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+
+        return datos.get(str(guild_id))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def guardar_canal_musica(guild_id, channel_id):
+    datos = {}
+
+    if os.path.exists(CANAL_MUSICA_CONFIG_FILE):
+        try:
+            with open(CANAL_MUSICA_CONFIG_FILE, "r", encoding="utf-8") as f:
+                datos = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            datos = {}
+
+    datos[str(guild_id)] = channel_id
+
+    with open(CANAL_MUSICA_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(datos, f, indent=4)
+
+
+def obtener_canal_musica(guild):
+    channel_id = cargar_canal_musica(guild.id)
+
+    if not channel_id:
+        return None
+
+    return guild.get_channel(channel_id)
+
 async def enviar_now_playing(ctx, item, state):
     tarea_anterior = state.get("update_task")
     if tarea_anterior:
@@ -590,23 +759,87 @@ async def enviar_now_playing(ctx, item, state):
         except (discord.NotFound, discord.Forbidden):
             pass
 
+    # Buscar el canal configurado para la interfaz musical
+    canal_musica = obtener_canal_musica(ctx.guild)
+
+    # Si no hay canal configurado, usar el canal donde se ejecutó el comando
+    if canal_musica is None:
+        canal_musica = ctx.channel
+
     view = MusicControlView(ctx.guild.id)
     embed = construir_embed_now_playing(item, state)
-    mensaje = await ctx.send(embed=embed, view=view)
+
+    mensaje = await canal_musica.send(
+        embed=embed,
+        view=view
+    )
 
     state["mensaje_now_playing"] = mensaje
-    state["update_task"] = bot.loop.create_task(actualizar_progreso(ctx.guild.id, mensaje))
-    guardar_now_playing_ref(ctx.guild.id, mensaje.channel.id, mensaje.id)
+    state["update_task"] = bot.loop.create_task(
+        actualizar_progreso(ctx.guild.id, mensaje)
+    )
+
+    guardar_now_playing_ref(
+        ctx.guild.id,
+        mensaje.channel.id,
+        mensaje.id
+    )
 
 
 async def generar_tts(texto, archivo="tts_temp.mp3"):
-    communicate = edge_tts.Communicate(texto, voice="pt-BR-AntonioNeural")
+    communicate = edge_tts.Communicate(texto, voice="pt-BR-FranciscaNeural")
     await communicate.save(archivo)
     return archivo
 
 
+def resolver_fuente_audio(item, volumen, seek=0):
+    """Construye el PCMVolumeTransformer de reproducción, tanto para canciones locales
+    como de YouTube (con reintento automático ante 403). Usada por play_next(), el
+    comando m!seek y el modo voz de la consola, para no repetir la misma lógica."""
+    seek_opts = f"-ss {seek}" if seek > 0 else ""
+
+    if item["tipo"] == "local":
+        ruta = f"data/{item['nombre']}.mp3"
+        if not os.path.exists(ruta):
+            raise FileNotFoundError(f"No se encontró {ruta}")
+        return discord.PCMVolumeTransformer(
+            discord.FFmpegPCMAudio(
+                ruta, executable=FFMPEG_PATH,
+                before_options=seek_opts or None,
+                stderr=FFMPEG_LOG,
+            ),
+            volume=volumen
+        )
+
+    # youtube (las URLs de stream expiran, por eso siempre se re-resuelven)
+    datos = extraer_audio_youtube_con_reintento(item["url"])
+    item["nombre"] = datos["titulo"]
+    item["duracion_seg"] = datos.get("duracion_seg")
+    item["thumbnail"] = datos.get("thumbnail")
+
+    before_options = f"{seek_opts} {FFMPEG_BEFORE_OPTIONS_YT}".strip()
+    return discord.PCMVolumeTransformer(
+        discord.FFmpegPCMAudio(
+            datos["stream_url"], executable=FFMPEG_PATH,
+            before_options=before_options,
+            stderr=FFMPEG_LOG,
+        ),
+        volume=volumen
+    )
+
+
 def play_next(voice_client, state, ctx):
-    if state["loop"] and state["current"]:
+    # Un m!seek en curso ya dejó todo listo manualmente; este avance disparado
+    # por el stop() interno hay que ignorarlo una sola vez.
+    if state.get("ignorar_avance"):
+        state["ignorar_avance"] = False
+        return
+
+    # Skip fuerza pasar a la siguiente canción aunque el loop esté activado.
+    forzar = state.get("forzar_siguiente", False)
+    state["forzar_siguiente"] = False
+
+    if state["loop"] and state["current"] and not forzar:
         item = state["current"]
     else:
         if not state["queue"]:
@@ -615,67 +848,56 @@ def play_next(voice_client, state, ctx):
         item = state["queue"].pop(0)
         state["current"] = item
 
-    if item["tipo"] == "youtube":
-        # Si viene con loop, re-resolvemos el stream (las URLs de YT expiran)
-        try:
-            datos = extraer_audio_youtube(item["url"])
-        except Exception:
-            bot.loop.create_task(ctx.send(f"⚠️ No se pudo reproducir `{item.get('nombre', item['url'])}`, saltando..."))
-            play_next(voice_client, state, ctx)
-            return
-
-        source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(
-                datos["stream_url"],
-                executable=FFMPEG_PATH,
-                before_options=FFMPEG_BEFORE_OPTIONS_YT,
-            ),
-            volume=state["volume"]
-        )
-        item["nombre"] = datos["titulo"]
-        item["duracion_seg"] = datos.get("duracion_seg")
-        item["thumbnail"] = datos.get("thumbnail")
-
-        def after(error):
-            bot.loop.call_soon_threadsafe(play_next, voice_client, state, ctx)
-
-        voice_client.play(source, after=after)
-        state["start_time"] = time.time()
-        state["minuto_avisado"] = False
-        bot.loop.create_task(enviar_now_playing(ctx, item, state))
-        bot.loop.create_task(monitor_minuto(ctx.guild.id))
-        return
-
-    # ── local ──
-    archivo = item["nombre"]
-    ruta = f"data/{archivo}.mp3"
-    if not os.path.exists(ruta):
-        bot.loop.create_task(ctx.send(f"⚠️ No se encontró `{archivo}.mp3`, saltando..."))
+    try:
+        source = resolver_fuente_audio(item, state["volume"])
+    except Exception as e:
+        print(f"[ERROR AUDIO] {e}")
+        bot.loop.create_task(ctx.send(f"⚠️ Não consegui reproduzir `{item.get('nombre', '?')}`, pulando..."))
         play_next(voice_client, state, ctx)
         return
 
-    source = discord.PCMVolumeTransformer(
-        discord.FFmpegPCMAudio(ruta, executable=FFMPEG_PATH),
-        volume=state["volume"]
-    )
+    if item["tipo"] == "local":
+        item["duracion_seg"] = get_duracion_segundos(f"data/{item['nombre']}.mp3")
 
     def after(error):
-        async def borrar():
-            await asyncio.sleep(1)
-            if os.path.exists(archivo):
-                try:
-                    os.remove(archivo)
-                except:
-                    pass
-        asyncio.run_coroutine_threadsafe(borrar(), bot.loop)
         bot.loop.call_soon_threadsafe(play_next, voice_client, state, ctx)
 
     voice_client.play(source, after=after)
     state["start_time"] = time.time()
     state["minuto_avisado"] = False
-    item["duracion_seg"] = get_duracion_segundos(ruta)
     bot.loop.create_task(enviar_now_playing(ctx, item, state))
     bot.loop.create_task(monitor_minuto(ctx.guild.id))
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def canal_musica(ctx, canal_id: int):
+    canal = ctx.guild.get_channel(canal_id)
+
+    if canal is None:
+        await ctx.send("❌ No encontré un canal con ese ID.", delete_after=5)
+        return
+
+    if not isinstance(canal, discord.TextChannel):
+        await ctx.send("❌ Ese ID no corresponde a un canal de texto.", delete_after=5)
+        return
+
+    guardar_canal_musica(ctx.guild.id, canal.id)
+
+    await ctx.message.delete()
+
+    mensaje = await canal.send(
+        "🎧 **Canal de música configurado.**\n"
+        "La interfaz de **Tocando agora** aparecerá acá automáticamente "
+        "cuando haya música reproduciéndose."
+    )
+
+    await asyncio.sleep(5)
+
+    try:
+        await mensaje.delete()
+    except discord.NotFound:
+        pass
+
 
 
 @bot.command()
@@ -691,7 +913,7 @@ async def tts(ctx, *, texto: str):
         voice.stop()
 
     source = discord.PCMVolumeTransformer(
-        discord.FFmpegPCMAudio(archivo, executable=FFMPEG_PATH),
+        discord.FFmpegPCMAudio(archivo, executable=FFMPEG_PATH, stderr=FFMPEG_LOG),
         volume=get_state(ctx.guild.id)["volume"]
     )
 
@@ -894,6 +1116,8 @@ async def play(ctx, *, query: str):
 async def skip(ctx):
     voice = ctx.voice_client
     if voice and (voice.is_playing() or voice.is_paused()):
+        state = get_state(ctx.guild.id)
+        state["forzar_siguiente"] = True  # avanza aunque loop esté activo
         voice.stop()
         await ctx.send("⏭️ Pular música...")
     else:
@@ -933,6 +1157,40 @@ async def resume(ctx):
         await ctx.send("❌ Nada está em pausa.")
 
 
+@bot.command()
+async def seek(ctx, segundos: int):
+    state = get_state(ctx.guild.id)
+    voice = ctx.voice_client
+
+    if not voice or not state["current"]:
+        await ctx.send("❌ Não há nada tocando agora.")
+        return
+    if segundos < 0:
+        await ctx.send("❌ O tempo deve ser positivo.")
+        return
+
+    item = state["current"]
+    try:
+        nueva_fuente = resolver_fuente_audio(item, state["volume"], seek=segundos)
+    except Exception as e:
+        print(f"[ERROR SEEK] {e}")
+        await ctx.send("⚠️ Não consegui pular para esse ponto.")
+        return
+
+    # El stop() dispara el "after" de la reproducción anterior; con esta bandera
+    # play_next() lo ignora una vez, en vez de avanzar la cola por error.
+    state["ignorar_avance"] = True
+    if voice.is_playing() or voice.is_paused():
+        voice.stop()
+
+    def after(error):
+        bot.loop.call_soon_threadsafe(play_next, voice, state, ctx)
+
+    voice.play(nueva_fuente, after=after)
+    state["start_time"] = time.time() - segundos
+    await ctx.send(f"⏩ Pulado para {formatear_tiempo(segundos)}.")
+
+
 # ── Cola ─────────────────────────────────────────────────────────────────────
 
 @bot.command()
@@ -949,10 +1207,26 @@ async def queue(ctx):
         msg += f"▶️ **Agora:** `{state['current']['nombre']}`{loop_icon}\n"
     if state["queue"]:
         msg += "\n**Seguindo:**\n"
-        for i, item in enumerate(state["queue"], start=1):
+        for i, item in enumerate(state["queue"][:10], start=1):
             msg += f"{i}. `{item['nombre']}`\n"
+        restantes = len(state["queue"]) - 10
+        if restantes > 0:
+            msg += f"\n*...e mais {restantes} música(s) na fila.*"
 
     await ctx.send(msg)
+
+@bot.command()
+async def remove(ctx, indice: int):
+    state = get_state(ctx.guild.id)
+    if not state["queue"]:
+        await ctx.send("📭 A fila está vazia.")
+        return
+    if not (1 <= indice <= len(state["queue"])):
+        await ctx.send(f"❌ Número inválido. Escolha entre 1 e {len(state['queue'])}.")
+        return
+
+    item = state["queue"].pop(indice - 1)
+    await ctx.send(f"🗑️ Removido da fila: `{item['nombre']}`")
 
 @bot.command()
 async def shuffle(ctx):
@@ -1013,9 +1287,12 @@ async def lista(ctx):
         return
 
     mensaje = "**Músicas disponíveis:**\n"
-    for i, tema in enumerate(temas, start=1):
+    for i, tema in enumerate(temas[:10], start=1):
         nombre_limpio = tema[:-4]
         mensaje += f"{i}. `{nombre_limpio}`\n"
+    restantes = len(temas) - 10
+    if restantes > 0:
+        mensaje += f"\n*...e mais {restantes} música(s). Use m!play <nome> para buscá-las.*"
 
     await ctx.send(mensaje)
 
@@ -1033,8 +1310,10 @@ async def help_music(ctx):
         "`m!skip` – Pular música atual\n"
         "`m!stop` – Parar e limpar a fila\n"
         "`m!pause` – Pausar\n"
-        "`m!resume` – Retomar\n\n"
+        "`m!resume` – Retomar\n"
+        "`m!seek <segundos>` – Pular para um ponto da música atual\n\n"
         "`m!queue` – Ver fila\n"
+        "`m!remove <número>` – Remover uma música específica da fila\n"
         "`m!shuffle` – Embaralhar fila\n"
         "`m!clear` – Limpar fila\n"
         "`m!loop` – Ativar/desativar loop\n"
@@ -1053,7 +1332,7 @@ async def mover(ctx, usuario: discord.Member, veces: int = 1):
     canal2 = bot.get_channel(954987154612822047)
     canal3 = bot.get_channel(1514142933551415356)
 
-    if not canal1 or not canal2:
+    if not canal1 or not canal2 or not canal3:
         await ctx.send("❌ Uno de los canales no existe.")
         return
     if usuario.voice is None:
@@ -1092,26 +1371,6 @@ async def hablar_usuario(ctx, usuario: discord.Member, *, mensaje: str):
 consola_activa = True
 modo_consola = "texto"
 
-def construir_source(item, volumen, seek=0):
-    seek_opts = f"-ss {seek}" if seek > 0 else ""
-
-    if item["tipo"] == "local":
-        ruta = f"data/{item['nombre']}.mp3"
-        return discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(ruta, executable=FFMPEG_PATH,
-                                    before_options=seek_opts or None),
-            volume=volumen
-        )
-    else:
-        datos = extraer_audio_youtube(item["url"])
-        before_options = f"{seek_opts} {FFMPEG_BEFORE_OPTIONS_YT}".strip()
-        return discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(datos["stream_url"], executable=FFMPEG_PATH,
-                                    before_options=before_options),
-            volume=volumen
-        )
-
-
 async def hablar_por_voz(texto):
     if not bot.voice_clients:
         print("⚠️ El bot no está en ningún canal de voz.")
@@ -1125,6 +1384,7 @@ async def hablar_por_voz(texto):
     elapsed = 0
     if estaba_sonando and state["start_time"]:
         elapsed = time.time() - state["start_time"]
+        state["ignorar_avance"] = True
         voice.stop()
 
     archivo = "tts_consola.mp3"
@@ -1141,7 +1401,7 @@ async def hablar_por_voz(texto):
                 pass
 
     source = discord.PCMVolumeTransformer(
-        discord.FFmpegPCMAudio(archivo, executable=FFMPEG_PATH),
+        discord.FFmpegPCMAudio(archivo, executable=FFMPEG_PATH, stderr=FFMPEG_LOG),
         volume=state["volume"]
     )
     voice.play(source, after=after_tts)
@@ -1149,12 +1409,16 @@ async def hablar_por_voz(texto):
 
     if estaba_sonando:
         try:
-            nuevo_source = construir_source(item_actual, state["volume"], seek=max(0, int(elapsed) - 1))
+            nuevo_source = resolver_fuente_audio(item_actual, state["volume"], seek=max(0, int(elapsed) - 1))
         except Exception:
             print("⚠️ No se pudo reanudar la canción tras el TTS.")
             return
 
-        voice.play(nuevo_source, after=lambda e: None)
+        def after(error):
+            bot.loop.call_soon_threadsafe(play_next, voice, state, None)
+
+        state["ignorar_avance"] = True
+        voice.play(nuevo_source, after=after)
         state["start_time"] = time.time() - elapsed
 
 

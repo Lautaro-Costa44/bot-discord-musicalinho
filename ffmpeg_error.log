@@ -1,0 +1,20 @@
+[https @ 000001c96c46ec00] HTTP error 403 Forbidden
+[in#0 @ 000001c96c45d440] Error opening input: Server returned 403 Forbidden (access denied)
+Error opening input file https://rr5---sn-uxaxjvh5gbxoupo5-x1xze.googlevideo.com/videoplayback?expire=1787559803&ei=G6uLauPtE8ujobIPvNmYyAc&ip=181.165.244.86&id=o-AMtQFIEHC5vPA9EPWOvhnddnvml9l6lVOMjRwOlJqxnM&itag=251&source=youtube&requiressl=yes&xpc=EgVo2aDSNQ%3D%3D&cps=170&met=1787538203%2C&mh=ru&mm=31%2C26&mn=sn-uxaxjvh5gbxoupo5-x1xze%2Csn-2onja5-5p&ms=au%2Conr&mv=m&mvi=5&pl=24&rms=au%2Cau&initcwndbps=2202500&bui=AR3QkAn8c9EaNIy8tv8_0F-C39a0X7xtpDPwb6S9o5SNRv7NdGrMa4VEd3HFxu-w8DifzNYCpoogyC2n&spc=KBGBck5-B4pJFBWg3AExbestQ2TpZwhbeZonHbLTpQ&vprv=1&svpuc=1&mime=audio%2Fwebm&rqh=1&gir=yes&clen=4090122&dur=254.621&lmt=1785464631286909&mt=1787537803&fvip=2&keepalive=yes&fexp=51565116&c=ANDROID_VR&txp=6208224&sparams=expire%2Cei%2Cip%2Cid%2Citag%2Csource%2Crequiressl%2Cxpc%2Cbui%2Cspc%2Cvprv%2Csvpuc%2Cmime%2Crqh%2Cgir%2Cclen%2Cdur%2Clmt&sig=AE0s2JYwRQIhAJaLgd-Cw0cJcwUgNfSQFGTQU9ydOZWKqbyDvCgGH7igAiBfx10CH4d_L1eHxHIgnUlEbtmwVZu96r1EQQOkrm66tw%3D%3D&lsparams=cps%2Cmet%2Cmh%2Cmm%2Cmn%2Cms%2Cmv%2Cmvi%2Cpl%2Crms%2Cinitcwndbps&lsig=APaTxxMwRAIgI_iNQ5Lht8kt1SBf8YyGL6EKvQrPcm9okbRmpvpNxuwCIFwj6Me8-zPotcNskL8SC8-ikfjFb0yZkrsqk1xewA_t.
+Error opening input files: Server returned 403 Forbidden (access denied)
+[tls @ 0000023157c73240] Error in the pull function.
+[tls @ 0000023157c73240] IO error: Error number -10054 occurred
+[https @ 0000023157d0e300] Will reconnect at 2260976 in 0 second(s), error=Error number -10054 occurred.
+[tls @ 0000023157c73240] The specified session has been invalidated for some reason.
+[tls @ 0000023159e32700] Error in the pull function.
+[tls @ 0000023159e32700] IO error: Error number -10054 occurred
+[https @ 0000023157d0e300] Will reconnect at 2703344 in 0 second(s), error=Error number -10054 occurred.
+[tls @ 0000023159e32700] The specified session has been invalidated for some reason.
+[tls @ 0000023159e33bc0] Error in the pull function.
+[tls @ 0000023159e33bc0] IO error: Error number -10054 occurred
+[https @ 0000023157d0e300] Will reconnect at 3194864 in 0 second(s), error=Error number -10054 occurred.
+[tls @ 0000023159e33bc0] The specified session has been invalidated for some reason.
+[tls @ 0000023159e32700] Error in the pull function.
+[tls @ 0000023159e32700] IO error: Error number -10054 occurred
+[https @ 0000023157d0e300] Will reconnect at 3604464 in 0 second(s), error=Error number -10054 occurred.
+[tls @ 0000023159e32700] The specified session has been invalidated for some reason.
