@@ -55,6 +55,56 @@ INSTRUCCION_MUSICA = (
 
 PATRON_MUSICA = re.compile(r"\[MUSICA:(LOCAL|YT:[^\]]*)\]", re.IGNORECASE)
 
+CLASIFICADOR_MUSICA_PROMPT = """Sos un clasificador. Analiza el mensaje de un usuario en un chat de Discord \
+y determiná si está pidiendo una acción sobre la música que se reproduce en el servidor (poner una \
+canción, pausar, reanudar, saltar, parar, o activar/desactivar loop).
+
+Sé ESTRICTO: si tenés dudas de que el mensaje sea realmente un pedido de acción, respondé que NO lo es. \
+No interpretes como pedido charla casual, preguntas sobre música (ej: "¿qué canción es esta?"), \
+menciones incidentales de canciones, ni mensajes ambiguos.
+
+Reglas para "accion" (solo si es_musica es true):
+- "play": quiere que se reproduzca algo (una canción, género, mood, artista, o "algo" genérico)
+- "skip": quiere pasar a la siguiente canción
+- "pause": quiere pausar
+- "resume": quiere reanudar/continuar
+- "stop": quiere detener todo
+- "loop": quiere activar o desactivar la repetición
+
+Si accion es "play":
+- "tipo" es "local" si el pedido es genérico, sin género/artista/canción específica (ej: "pone algo", "una cualquiera")
+- "tipo" es "youtube" si menciona género, mood, artista o canción específica, y "query" debe ser un \
+término de búsqueda efectivo para YouTube
+
+Respondé ÚNICAMENTE con un JSON con este formato exacto, sin texto adicional ni markdown:
+{{"es_musica": true|false, "accion": "play"|"skip"|"pause"|"resume"|"stop"|"loop"|null, "tipo": "local"|"youtube"|null, "query": "string o null"}}
+
+Mensaje del usuario: "{mensaje}"
+"""
+
+_modelo_clasificador_musica = None
+
+def get_modelo_clasificador_musica():
+    global _modelo_clasificador_musica
+    if _modelo_clasificador_musica is None:
+        _modelo_clasificador_musica = genai.GenerativeModel(
+            model_name="gemini-3.1-flash-lite",
+            generation_config={"response_mime_type": "application/json"}
+        )
+    return _modelo_clasificador_musica
+
+async def clasificar_pedido_musica(texto):
+    """Le pregunta a la IA (sin historial, llamada aislada) si el mensaje es un pedido de música
+    y qué acción/query implica. Devuelve un dict o None si no pudo clasificar / hubo error."""
+    modelo = get_modelo_clasificador_musica()
+    prompt = CLASIFICADOR_MUSICA_PROMPT.format(mensaje=texto.replace('"', "'"))
+    try:
+        respuesta = await asyncio.to_thread(modelo.generate_content, prompt)
+        return json.loads(respuesta.text)
+    except Exception as e:
+        print(f"[ERROR CLASIFICADOR MUSICA] {e}")
+        return None
+
 def extraer_comando_musica(texto):
     """Busca la tag oculta [MUSICA:...] en la respuesta de la IA, la saca del texto
     visible y devuelve qué reproducir (si corresponde)."""
@@ -249,6 +299,31 @@ async def detectar_accion_musica(message):
                                "stop": stop, "loop": loop}[accion]
                     await ctx.invoke(comando)
                 return True
+
+    # Ninguna palabra clave matcheó: le preguntamos a la IA si igual es un pedido de música.
+    datos = await clasificar_pedido_musica(message.content)
+    if not datos or not datos.get("es_musica"):
+        return False
+
+    accion = datos.get("accion")
+
+    if accion == "play":
+        tipo = datos.get("tipo")
+        query = datos.get("query")
+        if tipo == "local":
+            await ia_reproducir_musica(message, "local")
+        elif tipo == "youtube" and query:
+            await ia_reproducir_musica(message, "youtube", query)
+        else:
+            return False
+        return True
+
+    if accion in ("skip", "pause", "resume", "stop", "loop"):
+        comando = {"skip": skip, "pause": pause, "resume": resume,
+                   "stop": stop, "loop": loop}[accion]
+        await ctx.invoke(comando)
+        return True
+
     return False
 
 
@@ -580,6 +655,12 @@ def construir_barra_progreso(elapsed, total, longitud=18):
     return "▬" * pos + "🔘" + "▬" * (longitud - pos - 1)
 
 def construir_embed_now_playing(item, state):
+    if item is None:
+        return discord.Embed(
+            title="🎧 Nada tocando",
+            description="A fila está vazia.",
+            color=discord.Color.greyple()
+        )
     embed = discord.Embed(
         title="🎧 Tocando agora",
         description=f"**{item['nombre']}**",
@@ -829,32 +910,36 @@ def resolver_fuente_audio(item, volumen, seek=0):
 
 
 def play_next(voice_client, state, ctx):
-    # Un m!seek en curso ya dejó todo listo manualmente; este avance disparado
-    # por el stop() interno hay que ignorarlo una sola vez.
     if state.get("ignorar_avance"):
         state["ignorar_avance"] = False
         return
 
-    # Skip fuerza pasar a la siguiente canción aunque el loop esté activado.
-    forzar = state.get("forzar_siguiente", False)
-    state["forzar_siguiente"] = False
+    item = None
+    source = None
 
-    if state["loop"] and state["current"] and not forzar:
-        item = state["current"]
-    else:
-        if not state["queue"]:
-            state["current"] = None
-            return
-        item = state["queue"].pop(0)
-        state["current"] = item
+    while True:
+        forzar = state.get("forzar_siguiente", False)
+        state["forzar_siguiente"] = False
 
-    try:
-        source = resolver_fuente_audio(item, state["volume"])
-    except Exception as e:
-        print(f"[ERROR AUDIO] {e}")
-        bot.loop.create_task(ctx.send(f"⚠️ Não consegui reproduzir `{item.get('nombre', '?')}`, pulando..."))
-        play_next(voice_client, state, ctx)
-        return
+        if state["loop"] and state["current"] and not forzar:
+            item = state["current"]
+        else:
+            if not state["queue"]:
+                state["current"] = None
+                return
+            item = state["queue"].pop(0)
+            state["current"] = item
+
+        try:
+            source = resolver_fuente_audio(item, state["volume"])
+            break
+        except Exception as e:
+            print(f"[ERROR AUDIO] {e}")
+            bot.loop.create_task(ctx.send(f"⚠️ Não consegui reproduzir `{item.get('nombre', '?')}`, pulando..."))
+            if state["loop"]:
+                # Evita reintentar por siempre la misma canción rota en modo loop
+                state["forzar_siguiente"] = True
+            continue
 
     if item["tipo"] == "local":
         item["duracion_seg"] = get_duracion_segundos(f"data/{item['nombre']}.mp3")
@@ -985,6 +1070,21 @@ async def leave(ctx):
         state = get_state(ctx.guild.id)
         state["queue"].clear()
         state["current"] = None
+
+        tarea = state.get("update_task")
+        if tarea:
+            tarea.cancel()
+        state["update_task"] = None
+
+        mensaje_anterior = state.get("mensaje_now_playing")
+        if mensaje_anterior:
+            try:
+                await mensaje_anterior.delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
+        state["mensaje_now_playing"] = None
+        borrar_now_playing_ref(ctx.guild.id)
+
         await ctx.voice_client.disconnect()
         await ctx.send("👋 Eu saí do canal.")
 
