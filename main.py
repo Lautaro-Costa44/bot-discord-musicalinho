@@ -142,7 +142,7 @@ bot = commands.Bot(
     help_command=None
 )
 
-FFMPEG_PATH = "C:/ffmpeg/bin/ffmpeg.exe"
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 CANAL_TEXTO_ID = 1304862792238760018
 CANAL_MUSICA_CONFIG_FILE = "canal_musica.json"
 

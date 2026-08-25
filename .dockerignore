@@ -1,0 +1,7 @@
+.venv
+.git
+.vscode
+__pycache__
+*.pyc
+ffmpeg_error.log
+.env

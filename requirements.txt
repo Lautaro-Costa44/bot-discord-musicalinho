@@ -1,0 +1,8 @@
+discord.py
+python-dotenv
+mutagen
+edge-tts
+yt-dlp
+google-generativeai
+Pillow
+PyNaCl
