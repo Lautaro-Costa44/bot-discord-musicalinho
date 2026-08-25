@@ -202,6 +202,8 @@ def get_state(guild_id):
             "forzar_siguiente":   False,  # fuerza avanzar la cola aunque loop esté activo (skip)
             "ignorar_avance":     False,  # evita que un stop() manual (seek) dispare el avance de cola
             "historial":          [],     # canciones ya reproducidas, la más reciente al final
+            "hora_conexion":      None,   # timestamp de cuándo el bot se conectó al canal de voz
+            "vacio_desde":        None,   # timestamp de cuándo el canal quedó sin humanos
         }
     return guilds_state[guild_id]
 
@@ -1063,6 +1065,7 @@ async def ensure_voice(ctx):
     canal = ctx.author.voice.channel
     if ctx.voice_client is None:
         await canal.connect()
+        get_state(ctx.guild.id)["hora_conexion"] = time.time()
     else:
         await ctx.voice_client.move_to(canal)
     return True
@@ -1076,8 +1079,11 @@ def es_url_playlist(texto):
 
 # ── Eventos ──────────────────────────────────────────────────────────────────
 
+_vigilancia_iniciada = False
+
 @bot.event
 async def on_ready():
+    global _vigilancia_iniciada
     print(f"Conectado como {bot.user}")
     print(f"Servidores conectados ({len(bot.guilds)}):")
     for guild in bot.guilds:
@@ -1085,6 +1091,10 @@ async def on_ready():
     await limpiar_now_playing_anteriores()
     hilo = threading.Thread(target=consola, daemon=True)
     hilo.start()
+
+    if not _vigilancia_iniciada:
+        _vigilancia_iniciada = True
+        bot.loop.create_task(vigilar_canales_voz())
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -1108,28 +1118,79 @@ async def join(ctx):
         return
     await ctx.send("✅ Conectado ao canal de voz.")
 
+async def desconectar_de_canal(voice_client, guild_id):
+    """Limpia el estado de reproducción y desconecta del canal de voz.
+    La usan tanto m!leave como el vigilante automático de inactividad."""
+    state = get_state(guild_id)
+    state["queue"].clear()
+    state["current"] = None
+    state["hora_conexion"] = None
+    state["vacio_desde"] = None
+
+    tarea = state.get("update_task")
+    if tarea:
+        tarea.cancel()
+    state["update_task"] = None
+
+    mensaje_anterior = state.get("mensaje_now_playing")
+    if mensaje_anterior:
+        try:
+            await mensaje_anterior.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+    state["mensaje_now_playing"] = None
+    borrar_now_playing_ref(guild_id)
+
+    await voice_client.disconnect()
+
+
+CANAL_VACIO_ESPERA_SEG = 60           # gracia antes de salir si el canal se queda sin humanos
+SESION_MAXIMA_SEG = 60 * 60           # 1 hora conectado sin nada para reproducir
+INTERVALO_VIGILANCIA_SEG = 20
+
+async def vigilar_canales_voz():
+    """Tarea de fondo: revisa periódicamente todos los canales de voz donde
+    el bot está conectado y sale solo si el canal queda vacío o si pasó
+    demasiado tiempo sin nada que reproducir (música o TTS)."""
+    await bot.wait_until_ready()
+    while True:
+        await asyncio.sleep(INTERVALO_VIGILANCIA_SEG)
+        for guild in bot.guilds:
+            voice = guild.voice_client
+            if voice is None or voice.channel is None:
+                continue
+
+            state = get_state(guild.id)
+            ahora = time.time()
+            canal_texto = bot.get_channel(CANAL_TEXTO_ID)
+
+            humanos = [m for m in voice.channel.members if not m.bot]
+            if not humanos:
+                if state.get("vacio_desde") is None:
+                    state["vacio_desde"] = ahora
+                elif ahora - state["vacio_desde"] >= CANAL_VACIO_ESPERA_SEG:
+                    await desconectar_de_canal(voice, guild.id)
+                    if canal_texto:
+                        await canal_texto.send("👋 Saí do canal porque fiquei sozinho.")
+                    continue
+            else:
+                state["vacio_desde"] = None
+
+            hora_conexion = state.get("hora_conexion")
+            sin_nada_sonando = not voice.is_playing() and not voice.is_paused()
+            if hora_conexion and sin_nada_sonando and not state["queue"] \
+                    and (ahora - hora_conexion) >= SESION_MAXIMA_SEG:
+                await desconectar_de_canal(voice, guild.id)
+                if canal_texto:
+                    await canal_texto.send(
+                        "👋 Já faz mais de uma hora que estou aqui sem nada pra tocar, vou sair."
+                    )
+
+
 @bot.command()
 async def leave(ctx):
     if ctx.voice_client:
-        state = get_state(ctx.guild.id)
-        state["queue"].clear()
-        state["current"] = None
-
-        tarea = state.get("update_task")
-        if tarea:
-            tarea.cancel()
-        state["update_task"] = None
-
-        mensaje_anterior = state.get("mensaje_now_playing")
-        if mensaje_anterior:
-            try:
-                await mensaje_anterior.delete()
-            except (discord.NotFound, discord.Forbidden):
-                pass
-        state["mensaje_now_playing"] = None
-        borrar_now_playing_ref(ctx.guild.id)
-
-        await ctx.voice_client.disconnect()
+        await desconectar_de_canal(ctx.voice_client, ctx.guild.id)
         await ctx.send("👋 Eu saí do canal.")
 
 

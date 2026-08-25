@@ -18,3 +18,22 @@ Error opening input files: Server returned 403 Forbidden (access denied)
 [tls @ 0000023159e32700] IO error: Error number -10054 occurred
 [https @ 0000023157d0e300] Will reconnect at 3604464 in 0 second(s), error=Error number -10054 occurred.
 [tls @ 0000023159e32700] The specified session has been invalidated for some reason.
+[tls @ 000001ecb9c06740] Error in the pull function.
+[tls @ 000001ecb9c06740] IO error: Error number -10054 occurred
+[https @ 000001ecb9c9d180] Will reconnect at 3096560 in 0 second(s), error=Error number -10054 occurred.
+[tls @ 000001ecb9c06740] The specified session has been invalidated for some reason.
+[tls @ 000001ecbbca6480] Error in the pull function.
+[tls @ 000001ecbbca6480] IO error: Error number -10054 occurred
+[https @ 000001ecb9c9d180] Will reconnect at 3506160 in 0 second(s), error=Error number -10054 occurred.
+[tls @ 000001ecbbca6480] The specified session has been invalidated for some reason.
+[tls @ 00000190b15b6a80] Error in the pull function.
+[tls @ 00000190b15b6a80] IO error: Error number -10054 occurred
+[https @ 00000190b164eb00] Will reconnect at 1720320 in 0 second(s), error=Error number -10054 occurred.
+[tls @ 00000190b15b6a80] The specified session has been invalidated for some reason.
+[tls @ 00000190b37ff600] Error in the pull function.
+[tls @ 00000190b37ff600] IO error: Error number -10054 occurred
+[https @ 00000190b164eb00] Will reconnect at 3244016 in 0 second(s), error=Error number -10054 occurred.
+[tls @ 00000190b37ff600] The specified session has been invalidated for some reason.
+[in#0/mp3 @ 000002f162d70480] Estimating duration from bitrate, this may be inaccurate
+[in#0/mp3 @ 000002065af20140] Estimating duration from bitrate, this may be inaccurate
+[in#0/mp3 @ 0000024bc4c02ec0] Estimating duration from bitrate, this may be inaccurate
