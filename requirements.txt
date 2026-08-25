@@ -1,8 +1,8 @@
-discord.py
+discord.py[voice]
 python-dotenv
 mutagen
 edge-tts
 yt-dlp
 google-generativeai
 Pillow
-PyNaCl
+
