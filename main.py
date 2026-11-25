@@ -43,7 +43,7 @@ NOW_PLAYING_FILE = "now_playing.json"
 PREFIJO = "m!"
 
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
-MODELO_IA = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+MODELO_IA = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 
 def cargar_personalidad(archivo="personalidad.txt"):
